@@ -4,6 +4,8 @@ A SymbOS 4 mass-storage driver for the SD card of the **MSX Pico+** cartridge, p
 
 The driver talks to the SD card through the FBLabs SDXC-style SPI port that the MSX Pico+ already exposes in its "Nextor SD" modes. No firmware change and no Sunrise IDE emulation is needed.
 
+<img width="2000" height="1500" alt="picoplusmultipartition" src="https://github.com/user-attachments/assets/8d310a6b-0789-45f4-a4ae-dc9be07fef36" />
+
 ## Drivers
 
 | File | Source | Partitions | Status |
