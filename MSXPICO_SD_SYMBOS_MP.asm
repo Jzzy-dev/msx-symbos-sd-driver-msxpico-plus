@@ -1,0 +1,1263 @@
+; =============================================================================
+;  SymbOS 4 MSX mass-storage driver - MSX Pico SD Mapper, MULTI-PARTITION
+;  Version 0.9-MP (JeroenT's v0.8 + SeD_NcL's EBR walker for Nextor 3 volumes
+;                 + MMC CMD1 fallback + card re-init on every activation)
+; =============================================================================
+;
+;  ORIGINAL SD MAPPER V2 WORK
+;    Fabio Belavenuto        original MSX SD Mapper V2 (2014)
+;    Fabio R. Schmidlin     driver rewrite (2017-2018)
+;    Luciano Sturaro        PCB layout
+;    Elm-Chan               public SD/MMC SPI protocol documentation
+;
+;  SYMBOS MASS-STORAGE API
+;    Prodatron / SymbiosiS (Jorn Mika)
+;    Adaptation follows the SMD3 entry, bank and partition conventions of
+;    Prodatron/symdrv-msx-massstorage (Drv-WonderTANG.asm and Drv-SDMega.asm).
+;
+;  MSX PICO EXTENSION
+;    Firmware exposes ASCII16 register 6000h to select ROM bank 7.
+;    SPI transfer window: 7B00h-7EFFh; card CS: writes to 7FF0h.
+;    Read 7FF0h with *both cards deselected*: bit 7 indicates card model
+;      0 = two SD slots, 1 = one SD slot.
+;    Read 7FF0h with the requested SD card selected:
+;      bit 0 = hardware-latched card-change event (cleared by status read);
+;      bit 1 = card absent (active high);
+;      bit 2 = write-protected (active high).
+;    Hardware latches change independently for each selected SD slot.
+;    The driver does not use CMD13 polling or software-based card detection.
+;    Any changed or previously uninitialized card is initialized with the
+;    standard SD SPI sequence before sector access. Card removal returns an
+;    explicit SymbOS device-not-ready error; write protection returns an
+;    I/O error without sending a write command.
+;    7FF1h is an 8-bit hardware countdown timer (about 11 us/tick), used for
+;    command responses, data-token waits, write-busy waits and init timeout.
+;
+;  SYMBOS DEVICE MAPPING
+;    SymbOS channel 0 -> SD slot 1; channel 1 -> SD slot 2 (if available).
+;    Partition 0 = unpartitioned medium; 1 = MBR entry 1.
+;    Partitions 2-4: if the MBR has a Nextor 3 layout (entry 2 = extended
+;    #05/#0F, entries 3 and 4 empty, #55AA signature) they select logical
+;    volume 1-3 inside the extended partition (EBR chain). Otherwise they
+;    select MBR entry 2-4 as before.
+;
+;  0.9 CHANGES (from JZZY's Drv-SDXC.asm)
+;    - MMC cards: if CMD55/ACMD41 are rejected as illegal, initialise with
+;      CMD1 instead (byte addressing, CMD16 512).
+;    - DRVACT always re-initialises the card. Firmware v2.12 never sets the
+;      #7FF0 change bit, so a card swapped without a reboot was otherwise
+;      used with the old card's addressing mode.
+;
+;  MULTI-PARTITION EXTENSION
+;    EBR walker by SeD_NcL ("Sunrise EBR Test v2", msx.org SymbOS thread),
+;    ported from the reconstructed source in
+;    Jzzy-dev/msx-symbos-sunrise-ide-driver-picoverse. Every EBR and volume
+;    address is checked against the extended partition bounds and the 28-bit
+;    LBA limit, and the chain must move forward (loop protection).
+;    Current SymbOS ABI exposes the new medium when reactivated by SymbOS;
+;    no Nextor-specific status, drive mapping, or filesystem caches are used.
+;
+;  LIMITATIONS
+;    SymbOS/loader and physical SD hardware have not been tested here.
+;    Hot-swapping a mounted filesystem can corrupt cached data even with
+;    correct hardware change flags. Unmount or deactivate before removal.
+;    If hardware clears the latched change event on READ, avoid external
+;    status reads that might consume it before the driver does.
+;    Development build: test on a backed-up, disposable SD card first.
+;
+;  LICENSE
+;    SymbOS mass-storage driver examples: GPL-3.0 (see upstream repository).
+;    Original SD Mapper hardware documentation: CERN OHL v1.1.
+;    This derivative's source is intended to remain GPL-3.0-compatible;
+;    retain the upstream attribution and licensing terms.
+; =============================================================================
+
+; ---- SymbOS 4 MSX mass-storage ABI ------------------------------------------
+
+stobnkx         EQU 0815Ah      ; caller's buffer banking configuration
+bnkmonx         EQU 08112h      ; map buffer for sector transfer
+bnkmofx         EQU 08115h      ; restore SymbOS system memory map
+bnkdofx         EQU 08136h      ; restore page 1 and interrupt state
+stoadrx         EQU 08157h      ; HL -> current device record
+stobufx         EQU 0815Bh      ; pointer to SymbOS 512-byte shared buffer
+
+stoerrpno       EQU 4           ; missing partition
+stoerrptp       EQU 5           ; unsupported partition type
+stoerrsec       EQU 6           ; sector I/O error
+stoerrrdy       EQU 26          ; no responding SD card
+stoerrxch       EQU 32          ; unavailable SD slot/channel
+stotypoky       EQU 1
+stomedsdc       EQU 17
+stodatsta       EQU 0
+stodattyp       EQU 1
+stodatbeg       EQU 12
+stodatsub       EQU 26
+
+ideparadr       EQU 01BEh
+idepartyp       EQU 4
+ideparbeg       EQU 8
+ideparlen       EQU 12
+
+MSXVER          EQU 0002Dh
+SD_DATA         EQU 07B00h
+SD_SELECT       EQU 07FF0h
+SD_TIMER        EQU 07FF1h
+ROM_BANK_SELECT EQU 06000h
+SD_SPI_BANK     EQU 7
+
+SD_CMD0         EQU 040h
+SD_CMD1         EQU 041h
+SD_CMD8         EQU 048h
+SD_CMD16        EQU 050h
+SD_CMD17        EQU 051h
+SD_CMD24        EQU 058h
+SD_CMD55        EQU 077h
+SD_ACMD41       EQU 069h
+SD_CMD58        EQU 07Ah
+
+; ---- SymbOS relocatable driver header --------------------------------------
+
+ORG 01000h-32
+RELOCATE_START
+
+DB "SMD3"
+DW drvend-drvjmp                 ; size of driver data/code from jump table
+DW relocate_count                ; generated by SjASMPlus
+DS 8                             ; reserved
+DB 9,0,2                        ; version 0.9, SD media type 2
+DB "MSXPico SD MP"               ; 13-character SymbOS identification
+
+drvjmp:
+        DW drvinp,drvout,drvact,drvmof
+
+drvmof:
+        RET
+        DW 0
+        DB 32*2+15               ; SD media type + provisional driver ID 15
+        DS 4
+
+drvslt:
+        DS 3                     ; slot selection populated by SymbOS
+
+; ---- Driver variables (relocated together with executable code) ------------
+
+idepartok:
+        DB 01h,11h,04h,06h,0Eh,14h,16h,1Eh,0Bh,0Ch,1Bh,1Ch
+idepartan       EQU 12
+
+buffer_bank:     DB 0
+buffer_addr:     DW 0
+sector_count:    DB 0
+selected_slot:   DB 1           ; 1 or 2, same as SPI CS mask
+supported_slots: DB 0           ; loaded from 7FF0h bit 7
+initialized:     DB 0           ; bit0 = slot1; bit1 = slot2
+card_type1:      DB 0           ; 0=byte-addressed, 1=block-addressed (SDHC)
+card_type2:      DB 0
+init_v2:         DB 0           ; HCS used only for CMD8-compatible SDv2
+current_sector:  DS 4           ; little endian physical LBA
+command_arg:     DS 4           ; big endian SPI command parameter
+command_crc:     DB 0FFh
+command_byte:    DB 0
+last_error:      DB 0
+hardware_status: DB 0         ; last selected card status, read once/request
+
+; ---- SymbOS read/write entry points ----------------------------------------
+
+; Input: A=device ID, IY:IX=logical sector index, B=count, DE=buffer.
+; Output: CY=0 success, CY=1 and A=SymbOS storage error on failure.
+drvinp:
+        PUSH AF                    ; preserve actual SymbOS device number
+        LD A,B
+        LD (sector_count),A
+        POP AF
+        PUSH DE
+        CALL drvsec
+        JR C,drvtransfer_bad
+        CALL store_sector
+        POP HL
+        CALL prepare_buffer
+        JP drvred
+
+drvout:
+        PUSH AF
+        LD A,B
+        LD (sector_count),A
+        POP AF
+        PUSH DE
+        CALL drvsec
+        JR C,drvtransfer_bad
+        CALL store_sector
+        POP HL
+        CALL prepare_buffer
+        JP drvwrt
+
+drvtransfer_bad:
+        POP DE
+        RET
+
+; ---- Activate a SymbOS device and inspect the requested MBR partition -----
+
+; High nibble of stodatsub: channel 0 (SD1) or 1 (SD2).
+; Low nibble: 0=entire device; 1-4=MBR primary partition.
+drvact:
+        PUSH AF
+        CALL stoadrx
+        POP BC
+        EX DE,HL                ; DE = device record
+        LD HL,stodatsub
+        ADD HL,DE
+        LD A,(HL)
+        AND 0F0h
+        CP 010h
+        JR Z,drvact_slot2
+        OR A
+        JP NZ,drvact_bad_channel
+        LD A,1
+        JR drvact_slot_ok
+drvact_slot2:
+        LD A,2
+drvact_slot_ok:
+        LD (selected_slot),A
+        CALL sd_mark_offline    ; [0.9] force a fresh card init on activation
+        PUSH HL                 ; pointer to partition/channel value
+        PUSH DE                 ; device record
+        CALL drvini
+        JR C,drvact_init_error
+
+        XOR A
+        LD (current_sector),A
+        LD (current_sector+1),A
+        LD (current_sector+2),A
+        LD (current_sector+3),A
+        INC A
+        LD (sector_count),A
+        LD HL,(stobufx)
+        CALL prepare_buffer
+        CALL drvred            ; read physical sector 0 into shared buffer
+        POP DE
+        POP HL
+        RET C
+
+        LD A,(HL)
+        AND 0Fh
+        LD C,A
+        LD B,A
+        LD IY,0
+        JR Z,drvact_ready
+        CP 5
+        JR NC,drvact_missing_partition
+        CP 2
+        JP NC,ebr_check          ; [MP] 2-4 -> Nextor logical volume?
+drvact_primary:                  ; [MP] A=partition 1-4, DE=device record
+        LD IX,(stobufx)
+        LD BC,ideparadr
+        ADD IX,BC
+        LD BC,16
+        DEC A
+        JR Z,drvact_partition
+.part_loop:
+        ADD IX,BC
+        DEC A
+        JR NZ,.part_loop
+
+drvact_partition:
+        LD A,(IX+idepartyp)
+        OR A
+        JR Z,drvact_missing_partition
+        LD HL,idepartok
+        LD B,idepartan
+.part_type_loop:
+        CP (HL)
+        JR Z,.part_type_ok
+        INC HL
+        DJNZ .part_type_loop
+        LD A,stoerrptp
+        SCF
+        RET
+.part_type_ok:
+        LD C,(IX+ideparbeg+2)
+        LD B,(IX+ideparbeg+3)
+        PUSH BC
+        POP IY
+        LD C,(IX+ideparbeg)
+        LD B,(IX+ideparbeg+1)
+
+drvact_ready:
+        EX DE,HL                ; HL = device record
+        LD (HL),stotypoky
+        INC HL
+        LD (HL),stomedsdc
+        LD DE,stodatbeg-stodattyp
+        ADD HL,DE
+        LD (HL),C
+        INC HL
+        LD (HL),B
+        INC HL
+        PUSH IY
+        POP BC
+        LD (HL),C
+        INC HL
+        LD (HL),B
+        XOR A
+        RET
+
+drvact_init_error:
+        POP DE
+        POP HL
+        RET
+
+drvact_missing_partition:
+        LD A,stoerrpno
+        SCF
+        RET
+
+drvact_bad_channel:
+        LD A,stoerrxch
+        SCF
+        RET
+
+; ---- Translate SymbOS LBA and selected channel -----------------------------
+
+drvsec:
+        CALL stoadrx
+        PUSH HL
+        LD DE,stodatsub
+        ADD HL,DE
+        LD A,(HL)
+        AND 0F0h
+        CP 010h
+        JR Z,.slot2
+        OR A
+        JR NZ,.bad
+        LD A,1
+        JR .valid
+.slot2:
+        LD A,2
+.valid:
+        LD (selected_slot),A
+        POP HL
+        LD BC,stodatbeg
+        ADD HL,BC
+        LD C,(HL)
+        INC HL
+        LD B,(HL)
+        INC HL
+        ADD IX,BC
+        LD C,(HL)
+        INC HL
+        LD B,(HL)
+        JR NC,.no_carry
+        INC BC
+.no_carry:
+        ADD IY,BC
+        PUSH IX
+        POP DE
+        PUSH IY
+        POP BC
+        OR A
+        RET
+.bad:
+        POP HL
+        LD A,stoerrxch
+        SCF
+        RET
+
+store_sector:
+        LD A,E
+        LD (current_sector),A
+        LD A,D
+        LD (current_sector+1),A
+        LD A,C
+        LD (current_sector+2),A
+        LD A,B
+        LD (current_sector+3),A
+        RET
+
+advance_sector:
+        LD HL,current_sector
+        INC (HL)
+        RET NZ
+        INC HL
+        INC (HL)
+        RET NZ
+        INC HL
+        INC (HL)
+        RET NZ
+        INC HL
+        INC (HL)
+        RET
+
+prepare_buffer:
+        LD A,(stobnkx)
+        DI
+        CALL bnkmonx
+        LD (buffer_bank),A
+        LD (buffer_addr),HL
+        CALL bnkmofx
+        RET
+
+; ---- Physical SPI sector READ -----------------------------------------------
+
+drvred:
+        CALL drvshw
+.read_loop:
+        CALL sd_ready
+        JP C,drv_error            ; preserve absent/init/channel status from sd_ready
+        CALL build_lba_argument
+        LD A,SD_CMD17
+        CALL sd_command_default_crc
+        JP C,drv_error_read
+        OR A
+        JP NZ,drv_error_read
+        CALL wait_data_token
+        JP C,drv_error_read
+
+        LD A,(buffer_bank)
+        OUT (0FCh),A            ; expose caller's buffer in page 0
+        LD HL,SD_DATA
+        LD DE,(buffer_addr)
+        CALL transfer_sector
+        LD (buffer_addr),DE
+        CALL bnkmofx            ; restore OS map before other operations
+
+        LD A,(SD_DATA)          ; CRC1 (discard)
+        LD A,(SD_DATA)          ; CRC2 (discard)
+        CALL sd_deselect
+        CALL advance_sector
+        LD A,(sector_count)
+        DEC A
+        LD (sector_count),A
+        JP Z,drv_success
+        CALL drvhide
+        CALL drvshw
+        JR .read_loop
+
+; ---- Physical SPI sector WRITE ----------------------------------------------
+
+drvwrt:
+        CALL drvshw
+.write_loop:
+        CALL sd_ready
+        JP C,drv_error            ; preserve absent/init/channel status from sd_ready
+        LD A,(hardware_status)    ; bit 2=hardware write-protected
+        AND 004h
+        JP NZ,drv_error_write
+        CALL build_lba_argument
+        LD A,SD_CMD24
+        CALL sd_command_default_crc
+        JP C,drv_error_write
+        OR A
+        JP NZ,drv_error_write
+
+        LD A,0FEh               ; SD start-of-data token
+        LD (SD_DATA),A
+        LD A,(buffer_bank)
+        OUT (0FCh),A
+        LD HL,(buffer_addr)
+        LD DE,SD_DATA
+        CALL transfer_sector
+        LD (buffer_addr),HL
+        CALL bnkmofx
+
+        LD A,0FFh               ; CRC1/CRC2 when CRC checking disabled
+        LD (SD_DATA),A
+        LD (SD_DATA),A
+        CALL read_spi           ; data-response token
+        AND 01Fh
+        CP 5
+        JP NZ,drv_error_write
+        CALL wait_card_ready   ; busy while card programs its flash
+        JP C,drv_error_ready
+
+        CALL sd_deselect
+        CALL advance_sector
+        LD A,(sector_count)
+        DEC A
+        LD (sector_count),A
+        JP Z,drv_success
+        CALL drvhide
+        CALL drvshw
+        JR .write_loop
+
+drv_error_read:
+        LD A,stoerrsec
+        JR drv_error
+
+drv_error_write:
+        LD A,stoerrsec
+        JR drv_error
+
+drv_error_ready:
+        LD A,stoerrrdy
+
+drv_error:
+        LD (last_error),A
+        CALL sd_mark_offline
+        CALL sd_deselect
+        CALL drvhide
+        LD A,(last_error)
+        SCF
+        RET
+
+drv_success:
+        CALL sd_deselect
+        CALL drvhide
+        XOR A
+        RET
+
+; ---- Map SD ROM's SPI page into 4000h-7FFFh -------------------------------
+
+drvshw:
+        LD A,(drvslt+0)
+        DI
+        OUT (0A8h),A
+        LD A,(drvslt+1)
+        LD (0FFFFh),A
+        LD A,(drvslt+2)
+        OUT (0A8h),A
+        LD A,SD_SPI_BANK
+        LD (ROM_BANK_SELECT),A
+        RET
+
+drvhide:
+        JP bnkdofx
+
+; ---- Detect the physical one/two-slot hardware model -----------------------
+
+sample_model:
+        XOR A
+        LD (SD_SELECT),A       ; both CS lines inactive
+        LD A,(SD_SELECT)
+        AND 080h              ; the only valid readable bit!
+        LD A,2
+        JR Z,.two_slots
+        DEC A
+.two_slots:
+        LD (supported_slots),A
+        RET
+
+; Called from SymbOS activation. Hardware supplies per-card status bits.
+drvini:
+        CALL drvshw
+        CALL sample_model
+        CALL sd_ready
+        PUSH AF
+        CALL sd_deselect
+        CALL drvhide
+        POP AF                        ; preserve precise error from sd_ready
+        RET
+
+ ; ---- Card detection using hardware 7FF0h status ---------------------------
+
+; Called while ROM bank 7 is mapped into page 1. One hardware status read
+; per request is important: bit 0 is latched and acknowledged on read.
+; The media-change event is consumed only here, not by an independent probe.
+;
+; Input: selected_slot is 1 or 2.
+; Output: CY=0 if present and initialized, CY=1 if absent/init failed.
+;         hardware_status preserves the current card's bit 2 write-protect.
+sd_ready:
+        LD A,(selected_slot)
+        LD B,A
+        LD A,(supported_slots)
+        OR A
+        JR NZ,.limit_known
+        CALL sample_model          ; read bit 7, both slots deselected
+        LD A,(supported_slots)
+.limit_known:
+        CP B
+        JR C,.invalid_channel      ; requested slot not supported by model
+
+        ; The 7FF0h read reports selected-card status, not the model bit.
+        ; Card change is latched by firmware and acknowledged by this read.
+        LD A,B
+        LD (SD_SELECT),A          ; CS1/CS2 selection
+        LD A,(SD_SELECT)
+        LD (hardware_status),A
+        AND 002h                  ; bit 1=1 means physically absent
+        JR NZ,.absent
+
+        LD A,(hardware_status)
+        AND 001h                  ; bit 0=1 means changed since last read
+        CALL NZ,sd_mark_offline    ; invalidate initialized bit for slot
+
+        LD A,(selected_slot)
+        LD B,A
+        LD A,(initialized)
+        AND B
+        JR NZ,.ready              ; no change; keep initialized card
+
+        ; A newly inserted or replaced card needs normal SD initialization.
+        ; No software CMD13 probes or artificial reinsertion delays.
+        CALL sd_initialize
+        JR C,.init_failed
+        LD A,(initialized)
+        LD B,A
+        LD A,(selected_slot)
+        OR B
+        LD (initialized),A
+.ready:
+        XOR A
+        RET
+.absent:
+        CALL sd_mark_offline
+.not_ready:
+        LD A,stoerrrdy           ; selected card physically absent (7FF0 bit 1)
+        SCF
+        RET
+.init_failed:
+        LD A,stoerrsec           ; present per hardware, but SPI init failed
+        SCF
+        RET
+.invalid_channel:
+        LD A,stoerrxch           ; requested SD2 on a single-card model
+        SCF
+        RET
+
+sd_mark_offline:
+        LD A,(selected_slot)
+        CPL
+        LD B,A
+        LD A,(initialized)
+        AND B
+        LD (initialized),A
+        RET
+
+; Initialize an SDv1/v2/SDHC card, using bounded CMD0 and ACMD41 loops.
+sd_initialize:
+        CALL sd_deselect
+        LD B,10               ; >=80 clock pulses with CS inactive
+        LD A,0FFh
+.clocks:
+        LD (SD_DATA),A
+        DJNZ .clocks
+
+        LD B,8
+.cmd0:
+        PUSH BC
+        CALL clear_argument
+        LD A,095h
+        LD (command_crc),A
+        LD A,SD_CMD0
+        CALL sd_command
+        POP BC
+        JR C,.cmd0_retry
+        CP 1
+        JR Z,.cmd0_ok
+.cmd0_retry:
+        DJNZ .cmd0
+        SCF
+        RET
+.cmd0_ok:
+        CALL clear_argument
+        LD A,1
+        LD (command_arg+2),A
+        LD A,0AAh
+        LD (command_arg+3),A
+        LD A,087h
+        LD (command_crc),A
+        LD A,SD_CMD8
+        CALL sd_command
+        JR C,.failed
+        CP 1
+        JR Z,.v2
+        AND 4                  ; illegal command => SDSC v1
+        JR NZ,.v1
+        JR .failed
+.v2:
+        CALL read_spi         ; R7 byte 0 (should be 00h)
+        CALL read_spi         ; R7 byte 1 (should be 00h)
+        CALL read_spi         ; R7 byte 2 (should be 01h)
+        CP 1
+        JR NZ,.failed
+        CALL read_spi         ; R7 byte 3 (should be AAh)
+        CP 0AAh
+        JR NZ,.failed
+        LD A,1
+        LD (init_v2),A
+        JR .acmd_loop_setup
+.v1:
+        XOR A
+        LD (init_v2),A
+.acmd_loop_setup:
+        LD C,255              ; max ~715 ms using 255 timer periods
+.acmd_loop:
+        PUSH BC
+        CALL clear_arg_for_cmd55
+        LD A,SD_CMD55
+        CALL sd_command_default_crc
+        POP BC
+        JR C,.failed
+        AND 4                  ; [0.9] CMD55 illegal -> MMC
+        JP NZ,.mmc
+        PUSH BC
+        CALL set_acmd41_arg
+        LD A,SD_ACMD41
+        CALL sd_command_default_crc
+        POP BC
+        JR C,.failed
+        OR A
+        JR Z,.ready
+        CP 1
+        JP NZ,.mmc             ; [0.9] ACMD41 rejected -> try MMC CMD1
+        LD A,255
+        LD (SD_TIMER),A
+.wait:
+        LD A,(SD_TIMER)
+        OR A
+        JR NZ,.wait
+        DEC C
+        JR NZ,.acmd_loop
+.failed:
+        SCF
+        RET
+.ready:
+        CALL clear_argument
+        LD A,SD_CMD58
+        CALL sd_command_default_crc
+        JR C,.failed
+        OR A
+        JR NZ,.failed
+        CALL read_spi
+        AND 040h              ; OCR CCS bit: 1=block addressed SDHC/SDXC
+        LD B,A
+        CALL read_spi
+        CALL read_spi
+        CALL read_spi
+        LD A,B
+        OR A
+        JR Z,.sdsccard
+        LD A,1
+        JR .save_type
+.mmc:                           ; [0.9] MMC: CMD1 until ready, byte addressing
+        XOR A
+        LD (init_v2),A
+        LD C,255              ; max ~715 ms using 255 timer periods
+.mmc_loop:
+        PUSH BC
+        CALL clear_argument
+        LD A,SD_CMD1
+        CALL sd_command_default_crc
+        POP BC
+        JP C,.failed
+        OR A
+        JR Z,.sdsccard         ; ready -> CMD16 512, no CMD58 on MMC
+        CP 1
+        JP NZ,.failed
+        LD A,255
+        LD (SD_TIMER),A
+.mmc_wait:
+        LD A,(SD_TIMER)
+        OR A
+        JR NZ,.mmc_wait
+        DEC C
+        JR NZ,.mmc_loop
+        SCF
+        RET
+.sdsccard:
+        CALL clear_argument
+        LD A,2
+        LD (command_arg+2),A ; CMD16 block size = 512
+        LD A,SD_CMD16
+        CALL sd_command_default_crc
+        JR C,.failed
+        OR A
+        JR NZ,.failed
+        XOR A
+.save_type:
+        LD B,A
+        LD A,(selected_slot)
+        CP 1
+        LD A,B
+        JR NZ,.store_type2
+        LD (card_type1),A
+        JR .done
+.store_type2:
+        LD (card_type2),A
+.done:
+        CALL sd_deselect
+        XOR A
+        RET
+
+clear_arg_for_cmd55:
+        CALL clear_argument
+        RET
+
+set_acmd41_arg:
+        CALL clear_argument
+        ; Set HCS in CMD41 argument only after successful CMD8 (SD v2).
+        LD A,(init_v2)
+        OR A
+        RET Z
+        LD A,040h
+        LD (command_arg),A
+        RET
+
+clear_argument:
+        XOR A
+        LD (command_arg),A
+        LD (command_arg+1),A
+        LD (command_arg+2),A
+        LD (command_arg+3),A
+        RET
+
+; Build a big-endian 32-bit CMD17/CMD24 parameter from sector LBA.
+; Byte-addressed (SDSC) cards multiply by 512, SDHC does not.
+build_lba_argument:
+        LD A,(current_sector+3)
+        LD (command_arg),A
+        LD A,(current_sector+2)
+        LD (command_arg+1),A
+        LD A,(current_sector+1)
+        LD (command_arg+2),A
+        LD A,(current_sector)
+        LD (command_arg+3),A
+        LD A,(selected_slot)
+        CP 2
+        LD A,(card_type1)
+        JR NZ,.check_type
+        LD A,(card_type2)
+.check_type:
+        OR A
+        RET NZ                 ; block-addressed SDHC
+        LD B,9
+.shift:
+        LD HL,command_arg+3
+        SLA (HL)              ; shift low-order byte first
+        DEC HL
+        RL (HL)
+        DEC HL
+        RL (HL)
+        DEC HL
+        RL (HL)
+        DJNZ .shift
+        RET
+
+; ---- Command and SPI transport ----------------------------------------------
+
+read_spi:
+        LD A,(SD_DATA)
+        RET
+
+sd_deselect:
+        PUSH AF
+        XOR A
+        LD (SD_SELECT),A
+        LD A,0FFh
+        LD (SD_DATA),A
+        POP AF
+        RET
+
+sd_select_card:
+        XOR A
+        LD (SD_SELECT),A
+        LD A,0FFh
+        LD (SD_DATA),A
+        LD A,(selected_slot)
+        LD (SD_SELECT),A
+        LD A,0FFh
+        LD (SD_DATA),A
+        RET
+
+sd_command_default_crc:
+        LD (command_byte),A
+        LD A,0FFh
+        LD (command_crc),A
+        LD A,(command_byte)
+        JR sd_command
+
+; Input A = command byte (40h..7Fh), command_arg[0..3] big endian.
+; Output A=R1, CF=0 if received; CF=1 on ~2.8ms hardware timeout.
+sd_command:
+        LD (command_byte),A
+        CALL sd_select_card
+        LD A,(command_byte)
+        LD (SD_DATA),A
+        LD A,(command_arg)
+        LD (SD_DATA),A
+        LD A,(command_arg+1)
+        LD (SD_DATA),A
+        LD A,(command_arg+2)
+        LD (SD_DATA),A
+        LD A,(command_arg+3)
+        LD (SD_DATA),A
+        LD A,(command_crc)
+        LD (SD_DATA),A
+        ; Use the hardware timer, not a CPU-speed-dependent instruction count.
+        ; A valid R1 response always has bit 7 clear; keep clocking FFh until
+        ; the response arrives or the 255-tick (~2.8ms) deadline expires.
+        LD A,255
+        LD (SD_TIMER),A
+.r1loop:
+        LD A,(SD_DATA)
+        BIT 7,A
+        JR Z,.r1got
+        LD A,(SD_TIMER)
+        OR A
+        JR NZ,.r1loop
+        SCF
+        RET
+.r1got:
+        OR A                    ; clear carry, preserve R1 value
+        RET
+
+; Wait for data token FEh for up to ~500ms.
+wait_data_token:
+        LD B,192
+.outer:
+        LD A,255
+        LD (SD_TIMER),A
+.poll:
+        LD A,(SD_DATA)
+        CP 0FEh
+        RET Z
+        CP 0FFh
+        JR NZ,.bad_token
+        LD A,(SD_TIMER)
+        OR A
+        JR NZ,.poll
+        DJNZ .outer
+.bad_token:
+        SCF
+        RET
+
+; Wait until card releases DO (FFh). ~2.6 seconds maximum.
+wait_card_ready:
+        LD C,4
+.outer:
+        LD B,255
+.inner:
+        LD A,255
+        LD (SD_TIMER),A
+.poll:
+        LD A,(SD_DATA)
+        CP 0FFh
+        RET Z
+        LD A,(SD_TIMER)
+        OR A
+        JR NZ,.poll
+        DJNZ .inner
+        DEC C
+        JR NZ,.outer
+        SCF
+        RET
+
+; Compact 512-byte transfer: sixteen passes of 32 unrolled LDI opcodes.
+; Each pass transfers 32 bytes and costs 64 opcode bytes. The entire loop
+; fits within JR NZ's signed relative branch range (displacement -67), so
+; the branch needs NO absolute address and NO relocation-table entry.
+; A separately tracks the 16 passes because each LDI decrements BC.
+; SymbOS loads this driver into RAM; works on Z80 and R800 alike.
+; Input: HL = source, DE = destination. Returns HL/DE advanced by 512, BC=0.
+transfer_sector:
+        LD BC,512
+        LD A,16
+.loop:
+        REPT 32
+          LDI
+        ENDR
+        DEC A
+        JR NZ,.loop
+        RET
+
+; =============================================================================
+; [MP] EBR EXTENSION - Nextor 3 logical volumes (algorithm by SeD_NcL)
+; =============================================================================
+
+; EBR_CHECK -> A = partition 2..4, DE = device record, MBR in (stobufx).
+; Nextor layout -> walk the EBR chain to logical volume A-1, else fall back
+; to the primary MBR entry handling.
+ebr_check:
+        LD (ebr_rec),DE
+        LD (ebr_part),A
+        LD HL,(stobufx)
+        LD BC,ideparadr+16+idepartyp
+        ADD HL,BC
+        LD A,(HL)
+        CALL ebr_ext            ; MBR entry 2 extended?
+        JP NZ,ebr_primary
+        LD BC,16
+        ADD HL,BC
+        LD A,(HL)               ; entry 3 empty?
+        OR A
+        JP NZ,ebr_primary
+        ADD HL,BC
+        LD A,(HL)               ; entry 4 empty?
+        OR A
+        JP NZ,ebr_primary
+        CALL ebr_sig            ; Nextor layout -> MBR must be signed
+        JP NZ,ebr_nf
+        LD HL,(stobufx)
+        LD BC,ideparadr+16+ideparbeg
+        ADD HL,BC
+        CALL ebr_l32            ; DE:HL = extended partition start
+        LD (ebr_bas),HL
+        LD (ebr_bas+2),DE
+        LD (ebr_cur),HL
+        LD (ebr_cur+2),DE
+        CALL ebr_c28
+        JP C,ebr_nf
+        CALL ebr_zero
+        JP Z,ebr_nf
+        LD HL,(stobufx)
+        LD BC,ideparadr+16+ideparlen
+        ADD HL,BC
+        CALL ebr_l32
+        CALL ebr_adb            ; DE:HL = extended end (exclusive)
+        JP C,ebr_nf
+        CALL ebr_c28
+        JP C,ebr_nf
+        LD (ebr_end),HL
+        LD (ebr_end+2),DE
+        LD A,(ebr_part)
+        DEC A
+        LD (ebr_cnt),A          ; 1..3 = logical volume number
+
+ebr_loop:                       ; read EBR at (ebr_cur), follow chain
+        LD HL,(ebr_cur)
+        LD DE,(ebr_cur+2)
+        CALL ebr_rng            ; inside extended partition?
+        JP C,ebr_nf
+        CALL ebr_read           ; EBR -> (stobufx) through the normal read path
+        RET C
+        CALL ebr_sig
+        JP NZ,ebr_nf
+        LD HL,(stobufx)
+        LD BC,ideparadr+idepartyp
+        ADD HL,BC
+        LD A,(HL)               ; logical partition type
+        OR A
+        JP Z,ebr_nf
+        LD HL,idepartok
+        LD B,idepartan
+ebr_loop1:
+        CP (HL)
+        JP Z,ebr_next
+        INC HL
+        DJNZ ebr_loop1
+        LD A,stoerrptp
+        SCF
+        RET
+
+ebr_next:
+        LD A,(ebr_cnt)
+        DEC A
+        LD (ebr_cnt),A
+        JP Z,ebr_found          ; this is the wanted volume
+        LD HL,(stobufx)         ; follow link (EBR entry 2)
+        LD BC,ideparadr+16+idepartyp
+        ADD HL,BC
+        LD A,(HL)
+        CALL ebr_ext
+        JP NZ,ebr_nf            ; end of chain
+        LD BC,ideparbeg-idepartyp
+        ADD HL,BC
+        CALL ebr_l32
+        CALL ebr_zero
+        JP Z,ebr_nf
+        CALL ebr_adb            ; link is relative to extended start
+        JP C,ebr_nf
+        CALL ebr_c28
+        JP C,ebr_nf
+        CALL ebr_rng
+        JP C,ebr_nf
+        CALL ebr_inc            ; must move forward (loop protection)
+        JP C,ebr_nf
+        LD (ebr_cur),HL
+        LD (ebr_cur+2),DE
+        JP ebr_loop
+
+ebr_found:                      ; logical start is relative to this EBR
+        LD HL,(stobufx)
+        LD BC,ideparadr+ideparbeg
+        ADD HL,BC
+        CALL ebr_l32
+        CALL ebr_zero
+        JP Z,ebr_nf
+        CALL ebr_adc
+        JP C,ebr_nf
+        CALL ebr_c28
+        JP C,ebr_nf
+        CALL ebr_rng
+        JP C,ebr_nf
+        LD (ebr_lst),HL
+        LD (ebr_lst+2),DE
+        LD HL,(stobufx)
+        LD BC,ideparadr+ideparlen
+        ADD HL,BC
+        CALL ebr_l32
+        CALL ebr_zero
+        JP Z,ebr_nf
+        CALL ebr_adl            ; DE:HL = start + length
+        JP C,ebr_nf
+        LD A,H                  ; -1 = last sector
+        OR L
+        DEC HL
+        JP NZ,ebr_found1
+        DEC DE
+ebr_found1:
+        CALL ebr_rng            ; last sector inside extended partition?
+        JP C,ebr_nf
+        LD BC,(ebr_lst)
+        LD IY,(ebr_lst+2)
+        LD DE,(ebr_rec)
+        JP drvact_ready         ; store IY:BC as partition start
+
+ebr_primary:
+        LD DE,(ebr_rec)
+        LD A,(ebr_part)
+        JP drvact_primary
+
+ebr_nf:
+        LD A,stoerrpno
+        SCF
+        RET
+
+; EBR_READ -> read absolute sector (ebr_cur) into (stobufx)
+ebr_read:
+        LD HL,(ebr_cur)
+        LD (current_sector),HL
+        LD HL,(ebr_cur+2)
+        LD (current_sector+2),HL
+        LD A,1
+        LD (sector_count),A
+        LD HL,(stobufx)
+        CALL prepare_buffer
+        JP drvred
+
+; EBR_SIG -> ZF=1 if (stobufx) ends with #55,#AA
+ebr_sig:
+        LD HL,(stobufx)
+        LD BC,01FEh
+        ADD HL,BC
+        LD A,(HL)
+        CP 055h
+        RET NZ
+        INC HL
+        LD A,(HL)
+        CP 0AAh
+        RET
+
+; EBR_EXT -> ZF=1 if A is an extended partition type (#05/#0F)
+ebr_ext:
+        CP 00Fh
+        RET Z
+        CP 005h
+        RET
+
+; EBR_ZERO -> ZF=1 if DE:HL = 0
+ebr_zero:
+        LD A,H
+        OR L
+        OR D
+        OR E
+        RET
+
+; EBR_L32 -> DE:HL = 32-bit value at (HL)
+ebr_l32:
+        LD C,(HL)
+        INC HL
+        LD B,(HL)
+        INC HL
+        LD E,(HL)
+        INC HL
+        LD D,(HL)
+        LD H,B
+        LD L,C
+        RET
+
+; EBR_C28 -> CF=1 if DE:HL does not fit into 28-bit LBA
+ebr_c28:
+        LD A,D
+        CP 010h
+        CCF
+        RET
+
+; EBR_ADB/ADC/ADL -> DE:HL += ebr_bas / ebr_cur / ebr_lst (CF = overflow)
+ebr_adb:
+        LD BC,(ebr_bas)
+        ADD HL,BC
+        PUSH HL
+        EX DE,HL
+        LD BC,(ebr_bas+2)
+        ADC HL,BC
+        EX DE,HL
+        POP HL
+        RET
+ebr_adc:
+        LD BC,(ebr_cur)
+        ADD HL,BC
+        PUSH HL
+        EX DE,HL
+        LD BC,(ebr_cur+2)
+        ADC HL,BC
+        EX DE,HL
+        POP HL
+        RET
+ebr_adl:
+        LD BC,(ebr_lst)
+        ADD HL,BC
+        PUSH HL
+        EX DE,HL
+        LD BC,(ebr_lst+2)
+        ADC HL,BC
+        EX DE,HL
+        POP HL
+        RET
+
+; EBR_INC -> CF=1 if DE:HL <= ebr_cur
+ebr_inc:
+        PUSH HL
+        PUSH DE
+        LD B,H
+        LD C,L
+        LD HL,(ebr_cur)
+        OR A
+        SBC HL,BC
+        LD B,D
+        LD C,E
+        LD HL,(ebr_cur+2)
+        SBC HL,BC
+        POP DE
+        POP HL
+        CCF
+        RET
+
+; EBR_RNG -> CF=1 if DE:HL outside [ebr_bas, ebr_end)
+ebr_rng:
+        PUSH HL
+        PUSH DE
+        OR A
+        LD BC,(ebr_bas)
+        SBC HL,BC
+        EX DE,HL
+        LD BC,(ebr_bas+2)
+        SBC HL,BC
+        POP DE
+        POP HL
+        RET C
+        PUSH HL
+        PUSH DE
+        OR A
+        LD BC,(ebr_end)
+        SBC HL,BC
+        EX DE,HL
+        LD BC,(ebr_end+2)
+        SBC HL,BC
+        POP DE
+        POP HL
+        CCF
+        RET
+
+ebr_rec:   DW 0                 ; device record
+ebr_part:  DB 0                 ; requested partition (2..4)
+ebr_cnt:   DB 0                 ; logical volumes still to skip
+ebr_bas:   DW 0,0               ; extended partition start (LBA)
+ebr_cur:   DW 0,0               ; current EBR (LBA)
+ebr_end:   DW 0,0               ; extended partition end (exclusive)
+ebr_lst:   DW 0,0               ; logical partition start
+
+drvend:
+
+RELOCATE_TABLE
+RELOCATE_END

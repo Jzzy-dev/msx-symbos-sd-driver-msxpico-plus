@@ -6,18 +6,46 @@ The driver talks to the SD card through the FBLabs SDXC-style SPI port that the 
 
 ## Drivers
 
-| File | Source | Author | Status |
-|------|--------|--------|--------|
-| `MSXPICO.DRV` | `MSXPICO_SD_SYMBOS.asm` | JeroenT (creator of the MSX Pico+) | Works on real hardware |
-| none (reference only) | `research/Drv-SDXC.asm` | JZZY | v1.1, tested in the emulator harness only |
+| File | Source | Partitions | Status |
+|------|--------|------------|--------|
+| `MSXPICMP.DRV` | `MSXPICO_SD_SYMBOS_MP.asm` | Multiple, including Nextor 3 logical volumes | v0.9, works on real hardware |
+| `MSXPICO.DRV` | `MSXPICO_SD_SYMBOS.asm` | Primary partitions only | JeroenT's v0.8, works on real hardware |
+| none (reference only) | `research/Drv-SDXC.asm` | Primary partitions only | JZZY's v1.1, tested in the emulator harness only |
 
-`MSXPICO_SD_SYMBOS.asm` assembles byte-for-byte into `MSXPICO.DRV`:
+Build with [sjasmplus](https://github.com/z00m128/sjasmplus):
 
 ```
+sjasmplus --dirbol --raw=MSXPICMP.DRV MSXPICO_SD_SYMBOS_MP.asm
 sjasmplus --dirbol --raw=MSXPICO.DRV MSXPICO_SD_SYMBOS.asm
 ```
 
-Partition setting (Control Panel / Mass Storage): `0` = whole card, `1`-`4` = MBR primary partition. Channel 0 is the SD slot.
+Both sources assemble byte-for-byte into the `.DRV` files in this repo. Channel 0 is the SD slot.
+
+## MSXPICMP.DRV: multiple partitions (v0.9)
+
+`MSXPICMP.DRV` (SymbOS name "MSXPico SD MP") is JeroenT's v0.8 driver with three additions:
+
+- **Nextor 3 logical volumes:** SeD_NcL's EBR (extended boot record) walker, ported from [Jzzy-dev/msx-symbos-sunrise-ide-driver-picoverse](https://github.com/Jzzy-dev/msx-symbos-sunrise-ide-driver-picoverse). It checks every EBR and volume address against the extended partition bounds and the 28-bit LBA limit, and stops if the chain doesn't move forward.
+- **MMC cards:** if a card rejects CMD55/ACMD41 as illegal, the driver initialises it with CMD1 instead (byte addressing, CMD16 512). Taken from `research/Drv-SDXC.asm`.
+- **Card swaps:** the card is re-initialised every time SymbOS activates the drive. Firmware v2.12 never sets the `#7FF0` change bit, so without this a card swapped without a reboot kept the old card's addressing mode. Taken from `research/Drv-SDXC.asm`.
+
+The SD access code and the write handshake are JeroenT's, unchanged.
+
+Partition mapping (Control Panel / Mass Storage, "Primary partition" setting):
+
+| Setting | Nextor 3 layout* | Any other layout |
+|---------|------------------|------------------|
+| 0 | whole card | whole card |
+| 1 | primary partition (first volume) | MBR entry 1 |
+| 2 | logical volume 1 | MBR entry 2 |
+| 3 | logical volume 2 | MBR entry 3 |
+| 4 | logical volume 3 | MBR entry 4 |
+
+\* MBR entry 2 is an extended partition (`#05`/`#0F`), entries 3 and 4 are empty, and the MBR has a valid `#55AA` signature.
+
+Supported volume types are FAT12, FAT16 and FAT32. As with the PicoVerse multi-partition driver, SeD_NcL's patched `SYM.COM` and `SYMBOS.BIN` ("Sector Fix v7") fix a SymbOS 4.0 kernel bug that reports disk error 032 on some volumes. They're available from the msx.org SymbOS thread.
+
+`MSXPICO.DRV` (JeroenT's v0.8) uses settings `1`-`4` as MBR primary partitions only.
 
 ## How the MSX Pico+ exposes the SD card
 
@@ -81,11 +109,11 @@ The speeds ignore MSX wait states and any delay the Pico+ adds.
 
 The stock SymbOS Sunrise driver sends ATA `#F8` (READ NATIVE MAX ADDRESS) on activation, and PicoVerse doesn't implement it. Sunrise emulation is possible on MSX Pico+ hardware, but only in its closed firmware, so that is up to its author. The native SPI driver makes it unnecessary for SymbOS.
 
-## Known limitations of MSXPICO.DRV
+## Known limitations
 
-- MMC cards don't initialise (no CMD1 fallback).
-- On v2.12 a swapped card isn't noticed until an I/O error forces re-initialisation. Reboot or re-activate after a read error when swapping cards.
-- Only primary MBR partitions. Nextor 3 logical volumes need the multi-partition version, which is in testing.
+- `MSXPICMP.DRV`: only the first three logical volumes can be reached (settings 2-4).
+- `MSXPICO.DRV`: MMC cards don't initialise, and on v2.12 a swapped card isn't noticed until an I/O error forces re-initialisation. Both are fixed in `MSXPICMP.DRV`.
+- Hot-swapping a card while a volume on it is in use can corrupt cached data. Deactivate the drive before removing the card.
 - Keep the Pico+ "USB SD-card access" setting off while SymbOS runs, so the firmware and SymbOS don't both use the card.
 
 ## Test harness
@@ -95,16 +123,25 @@ The stock SymbOS Sunrise driver sends ATA `#F8` (READ NATIVE MAX ADDRESS) on act
 ```
 git clone --depth 1 https://github.com/superzazu/z80 z80core
 gcc -O2 -I z80core -o harness test/harness.c z80core/z80.c
-./harness MSXPICO.DRV 1          # standard suite, bank-7 gate on
-./harness MSXPICO.DRV 1 swap     # card-swap scenario
-./harness MSXPICO.DRV 1 mp       # Nextor 3 logical-volume layouts
+./harness MSXPICMP.DRV 1          # standard suite, bank-7 gate on
+./harness MSXPICMP.DRV 1 swap     # card-swap scenario
+./harness MSXPICMP.DRV 1 mp       # Nextor 3 logical-volume layouts
 ```
 
-The standard suite's expectations follow our driver: on `MSXPICO.DRV` the channel-1 checks (error 32 by design) and the MMC checks fail, 18 in all. The `mp` suite expects logical-volume support, so `MSXPICO.DRV` fails its settings 2-4 checks. The card model was written from the SD specification, not checked against real cards.
+The `mp` suite checks settings 0-5 on a Nextor 3 layout, reads and writes inside logical volumes, and broken layouts: a looping EBR chain, a volume past the extended partition's end, an unsupported type, missing signatures and a non-Nextor MBR.
+
+| Suite | `MSXPICMP.DRV` v0.9 | `MSXPICO.DRV` v0.8 |
+|-------|---------------------|--------------------|
+| standard | 4 failures (channel-1 checks: error 32 by design) | 18 failures (channel-1 + MMC) |
+| swap | pass | fail |
+| mp (SDHC and SDSC) | pass, 38 checks | fails settings 2-4 (no logical volumes) |
+
+The card model was written from the SD specification, not checked against real cards.
 
 ## Credits
 
 - SymbOS driver: JeroenT (MSX Pico+)
+- Nextor 3 logical partition support (EBR walker): [SeD_NcL](https://www.msx.org/users/sed-ncl)
 - SymbOS and its mass-storage driver API: Prodatron / SymbiosiS (Jörn Mika), [symdrv-msx-massstorage](https://github.com/Prodatron/symdrv-msx-massstorage)
 - FBLabs SD Mapper / SDXC and its Nextor driver: Fabio Belavenuto, Fabio R. Schmidlin
 - Reverse engineering, comparison, harness: JZZY
